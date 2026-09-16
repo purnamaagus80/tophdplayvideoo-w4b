@@ -1,0 +1,356 @@
+name: Windows Utility Runner (6 Hours)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  runner-job:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        node: [1, 2, 3, 4, 5]
+
+    steps:
+
+      # ==============================
+      # STARTUP DELAY
+      # ==============================
+      - name: Startup Delay
+        shell: powershell
+        run: |
+          $delay = Get-Random -Minimum 10 -Maximum 40
+          Write-Host "Startup delay: $delay seconds"
+          Start-Sleep -Seconds $delay
+
+
+      # ==============================
+      # PREPARE REMOTE DESKTOP
+      # ==============================
+      - name: Prepare RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          try {
+            Write-Host "Enabling Remote Desktop..."
+
+            Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fDenyTSConnections" `
+              -Value 0
+
+            Set-ItemProperty `
+              -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "UserAuthentication" `
+              -Value 1
+
+            Enable-NetFirewallRule `
+              -DisplayGroup "Remote Desktop"
+
+            Write-Host "Remote Desktop configuration completed."
+          }
+          catch {
+            Write-Warning "RDP preparation failed: $($_.Exception.Message)"
+          }
+
+
+      # ==============================
+      # CREATE LOCAL USER
+      # ==============================
+      - name: Create User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "user$env:GITHUB_RUN_NUMBER"
+
+          # Character sets
+          $upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          $lower = "abcdefghijklmnopqrstuvwxyz"
+          $numbers = "0123456789"
+
+          $allChars = ($upper + $lower + $numbers).ToCharArray()
+
+          # Make sure password contains:
+          # 1 uppercase
+          # 1 lowercase
+          # 1 number
+          $passwordChars = @()
+
+          $passwordChars += $upper[(Get-Random -Maximum $upper.Length)]
+          $passwordChars += $lower[(Get-Random -Maximum $lower.Length)]
+          $passwordChars += $numbers[(Get-Random -Maximum $numbers.Length)]
+
+          # Add 9 random characters
+          1..9 | ForEach-Object {
+            $passwordChars += $allChars[(Get-Random -Maximum $allChars.Length)]
+          }
+
+          # Shuffle password characters
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          try {
+
+            $existingUser = Get-LocalUser `
+              -Name $username `
+              -ErrorAction SilentlyContinue
+
+            if (-not $existingUser) {
+
+              New-LocalUser `
+                -Name $username `
+                -Password $securePass `
+                -PasswordNeverExpires:$true `
+                -AccountNeverExpires:$true
+
+              Write-Host "User created: $username"
+            }
+            else {
+              Write-Host "User already exists: $username"
+            }
+
+            try {
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member $username `
+                -ErrorAction Stop
+
+              Write-Host "User added to Administrators."
+
+            }
+            catch {
+
+              Write-Warning "Could not add user to Administrators: $($_.Exception.Message)"
+
+            }
+
+            # Save variables for next steps
+            "R_USER=$username" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+            "R_PASS=$password" | Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+          }
+          catch {
+
+            Write-Error "User creation failed: $($_.Exception.Message)"
+            exit 1
+
+          }
+
+
+      # ==============================
+      # INSTALL TAILSCALE
+      # ==============================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.msi"
+
+          Write-Host "Downloading Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $installer
+
+          if (-not (Test-Path $installer)) {
+
+            Write-Error "Tailscale installer was not downloaded."
+            exit 1
+
+          }
+
+          Write-Host "Installing Tailscale..."
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -ne 0) {
+
+            Write-Error "Tailscale installation failed. Exit code: $($process.ExitCode)"
+            exit 1
+
+          }
+
+          Write-Host "Tailscale installation completed."
+
+
+      # ==============================
+      # CONNECT TAILSCALE
+      # ==============================
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+
+            Write-Error "Tailscale executable not found."
+            exit 1
+
+          }
+
+          $node = "${{ matrix.node }}"
+          $hostname = "node-$env:GITHUB_RUN_ID-$node"
+
+          Write-Host "Hostname: $hostname"
+
+          $success = $false
+
+          # Retry Tailscale connection
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+
+            Write-Host "Tailscale connection attempt $attempt of 5..."
+
+            try {
+
+              & $ts up `
+                "--authkey=$env:TAILSCALE_AUTH_KEY" `
+                "--hostname=$hostname" `
+                "--reset"
+
+              Start-Sleep -Seconds 10
+
+              $status = & $ts status 2>&1
+
+              Write-Host "Tailscale status:"
+              Write-Host $status
+
+              if ($status -notmatch "NeedsLogin") {
+
+                $success = $true
+
+                Write-Host "Tailscale connected successfully."
+
+                break
+
+              }
+
+            }
+            catch {
+
+              Write-Warning "Connection attempt failed: $($_.Exception.Message)"
+
+            }
+
+            if ($attempt -lt 5) {
+
+              Write-Host "Waiting before retry..."
+
+              Start-Sleep -Seconds 10
+
+            }
+
+          }
+
+          if (-not $success) {
+
+            Write-Error "Unable to connect to Tailscale after 5 attempts."
+            exit 1
+
+          }
+
+          # Get Tailscale IPv4
+          $ip = $null
+
+          for ($attempt = 1; $attempt -le 10; $attempt++) {
+
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
+
+            if ($ip) {
+
+              break
+
+            }
+
+            Write-Host "Waiting for Tailscale IPv4 address..."
+
+            Start-Sleep -Seconds 5
+
+          }
+
+          if (-not $ip) {
+
+            Write-Error "Tailscale IPv4 address was not available."
+            exit 1
+
+          }
+
+          Write-Host "Tailscale IPv4: $ip"
+
+          # Save IP for next step
+          "R_HOST=$ip" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+
+      # ==============================
+      # SHOW ACCESS INFORMATION
+      # ==============================
+      - name: Show Info
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "       ACCESS INFORMATION"
+          Write-Host "================================"
+          Write-Host "Host : $env:R_HOST"
+          Write-Host "User : $env:R_USER"
+          Write-Host "Pass : $env:R_PASS"
+          Write-Host "Node : ${{ matrix.node }}"
+          Write-Host "=================="
+          Write-Host ""
+
+
+      # ==============================
+      # KEEP SESSION ACTIVE
+      # ==============================
+      - name: Active Session (6 Hours)
+        shell: powershell
+        run: |
+          $end = (Get-Date).AddMinutes(350)
+
+          Write-Host "Session started."
+          Write-Host "Active until: $end"
+
+          while ((Get-Date) -lt $end) {
+
+            # Check running processes
+            $processCount = (Get-Process).Count
+
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active. Processes: $processCount"
+
+            # Wait 2-5 minutes
+            $delay = Get-Random -Minimum 120 -Maximum 300
+
+            Start-Sleep -Seconds $delay
+
+          }
+
+          Write-Host "Active session completed."
